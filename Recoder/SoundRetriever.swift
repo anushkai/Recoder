@@ -2,6 +2,7 @@
 import AVFoundation
 import ScreenCaptureKit
 import Speech
+import CoreVideo
 
 // Available on macOS 12.3+
 @available(macOS 12.3, *)
@@ -76,8 +77,13 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.width = Int(mainDisplay.width)
-        config.height = Int(mainDisplay.height)
+    
+        config.pixelFormat = kCVPixelFormatType_32ARGB
+        config.width = 1
+        config.height = 1
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+
+
         print("[LOG] Creating SCStream with filter and config...")
         stream = SCStream(filter: filter, configuration: config, delegate: nil)
         
