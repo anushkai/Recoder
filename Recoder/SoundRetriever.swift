@@ -4,6 +4,125 @@ import ScreenCaptureKit
 import Speech
 import CoreVideo
 
+// Alternative audio capture method using AVAudioEngine
+class AlternativeAudioTranscriber: NSObject, ObservableObject {
+    @Published var isRecording = false
+    @Published var transcription = ""
+    @Published var errorMessage: String?
+    
+    private let audioEngine = AVAudioEngine()
+    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))!
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var onTranscriptionUpdate: ((String) -> Void)?
+    
+    func setTranscriptionCallback(_ callback: @escaping (String) -> Void) {
+        onTranscriptionUpdate = callback
+    }
+    
+    func start() async throws {
+        print("[LOG] Starting AlternativeAudioTranscriber...")
+        
+        // Check speech recognition permissions
+        let speechAuth = SFSpeechRecognizer.authorizationStatus()
+        if speechAuth != .authorized {
+            await requestSpeechPermission()
+            if SFSpeechRecognizer.authorizationStatus() != .authorized {
+                throw TranscriptionError.permissionDenied
+            }
+        }
+        
+        // Get available audio devices
+        let devices = AVAudioSession.sharedInstance().availableInputs ?? []
+        print("[LOG] Available audio devices: \(devices.map { $0.portName })")
+        
+        // Try to find a suitable input device
+        guard let inputDevice = devices.first(where: { $0.portType == .builtInMic || $0.portType == .bluetoothA2DP }) else {
+            throw TranscriptionError.noAudioDeviceFound
+        }
+        
+        print("[LOG] Using audio device: \(inputDevice.portName)")
+        
+        // Configure audio session
+        try AVAudioSession.sharedInstance().setCategory(.record, mode: .measurement, options: .duckOthers)
+        try AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+        
+        // Set up audio engine
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        
+        print("[LOG] Recording format: \(recordingFormat)")
+        
+        // Install tap on input node
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            self?.recognitionRequest?.append(buffer)
+        }
+        
+        // Prepare and start audio engine
+        audioEngine.prepare()
+        try audioEngine.start()
+        
+        // Set up speech recognition
+        setupSpeechRecognition()
+        
+        await MainActor.run {
+            self.isRecording = true
+            self.errorMessage = nil
+        }
+        
+        print("[LOG] AlternativeAudioTranscriber started successfully")
+    }
+    
+    func stop() {
+        print("[LOG] Stopping AlternativeAudioTranscriber...")
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        recognitionRequest = nil
+        
+        try? AVAudioSession.sharedInstance().setActive(false)
+        
+        await MainActor.run {
+            self.isRecording = false
+        }
+        print("[LOG] AlternativeAudioTranscriber stopped")
+    }
+    
+    private func setupSpeechRecognition() {
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        recognitionRequest!.shouldReportPartialResults = true
+        recognitionRequest!.taskHint = .dictation
+        
+        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest!) { [weak self] result, error in
+            guard let self = self else { return }
+            
+            if let result = result {
+                let text = result.bestTranscription.formattedString
+                DispatchQueue.main.async {
+                    self.transcription = text
+                    self.onTranscriptionUpdate?(text)
+                }
+            }
+            
+            if let error = error {
+                print("[ERROR] Speech recognition error: \(error)")
+                DispatchQueue.main.async {
+                    self.errorMessage = "Recognition error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    
+    private func requestSpeechPermission() async {
+        await withCheckedContinuation { continuation in
+            SFSpeechRecognizer.requestAuthorization { _ in
+                continuation.resume()
+            }
+        }
+    }
+}
+
 // Available on macOS 12.3+
 @available(macOS 12.3, *)
 class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate {
@@ -79,28 +198,31 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStre
             throw TranscriptionError.noDisplaysFound
         }
         print("[LOG] Using display: \(mainDisplay.frame)")
+        print("[LOG] Available displays: \(content.displays.map { $0.frame })")
         
-        // Configure the stream to capture ONLY audio.
+        // Try using a more permissive filter
         let filter = SCContentFilter(display: mainDisplay, excludingApplications: [], exceptingWindows: [])
         let config = SCStreamConfiguration()
     
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-
-        // 2. Provide a minimal, valid video configuration to prevent system errors.
-        // SCStream expects this even if you only process audio.
-        config.width = 2 // Use a minimal non-zero size
-        config.height = 2
-
-        // 3. Set a common pixel format. kCVPixelFormatType_32ARGB is a good default.
-        config.pixelFormat = kCVPixelFormatType_32ARGB
-
-        // 4. Set a low frame rate to minimize performance overhead.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 10)
+        config.width = Int(mainDisplay.width)
+        config.height = Int(mainDisplay.height)
 
 
         print("[LOG] Creating SCStream with filter and config...")
-        stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        print("[LOG] Display: \(mainDisplay.frame), width: \(config.width), height: \(config.height)")
+        
+        do {
+            stream = SCStream(filter: filter, configuration: config, delegate: nil)
+            print("[LOG] SCStream creation completed")
+        } catch {
+            print("[ERROR] SCStream creation failed: \(error)")
+            await MainActor.run { 
+                self.errorMessage = "Failed to create screen capture stream: \(error.localizedDescription)"
+            }
+            throw TranscriptionError.streamCreationFailed
+        }
         
         // Check if stream creation failed
         guard let stream = stream else {
@@ -266,6 +388,7 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStre
     private func checkScreenRecordingPermission() -> Bool {
         let hasPermission = CGPreflightScreenCaptureAccess()
         print("[LOG] CGPreflightScreenCaptureAccess returned: \(hasPermission)")
+        
         if !hasPermission {
             print("[WARN] Screen recording permission not granted")
             return false
@@ -288,6 +411,7 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStre
         case streamError
         case streamCreationFailed
         case screenRecordingDenied
+        case noAudioDeviceFound
         var errorDescription: String? {
             switch self {
             case .permissionDenied:
@@ -300,6 +424,8 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStre
                 return "Failed to create screen capture stream. This usually means screen recording permission is not granted or the system doesn't support screen capture."
             case .screenRecordingDenied:
                 return "Screen recording permission denied. Please enable it in System Settings > Privacy & Security > Screen Recording."
+            case .noAudioDeviceFound:
+                return "No suitable audio input device found"
             }
         }
     }
