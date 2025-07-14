@@ -6,7 +6,7 @@ import CoreVideo
 
 // Available on macOS 12.3+
 @available(macOS 12.3, *)
-class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput {
+class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate {
     @Published var isRecording = false
     @Published var transcription = ""
     @Published var errorMessage: String?
@@ -16,6 +16,14 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var onTranscriptionUpdate: ((String) -> Void)?
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("[ERROR] Stream stopped with error: \(error.localizedDescription)")
+        Task { @MainActor in
+            self.errorMessage = "The stream stopped unexpectedly: \(error.localizedDescription)"
+            self.isRecording = false
+        }
+    }
     
     func setTranscriptionCallback(_ callback: @escaping (String) -> Void) {
         print("[LOG] Setting transcription callback")
@@ -75,13 +83,20 @@ class ModernAudioTranscriber: NSObject, ObservableObject, SCStreamOutput {
         // Configure the stream to capture ONLY audio.
         let filter = SCContentFilter(display: mainDisplay, excludingApplications: [], exceptingWindows: [])
         let config = SCStreamConfiguration()
+    
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-    
+
+        // 2. Provide a minimal, valid video configuration to prevent system errors.
+        // SCStream expects this even if you only process audio.
+        config.width = 2 // Use a minimal non-zero size
+        config.height = 2
+
+        // 3. Set a common pixel format. kCVPixelFormatType_32ARGB is a good default.
         config.pixelFormat = kCVPixelFormatType_32ARGB
-        config.width = 1
-        config.height = 1
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+
+        // 4. Set a low frame rate to minimize performance overhead.
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 10)
 
 
         print("[LOG] Creating SCStream with filter and config...")
